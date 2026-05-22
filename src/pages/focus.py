@@ -89,7 +89,7 @@ def focus_page(page: ft.Page) -> ft.Control:
         btn_start.disabled = selected_topic[0] is None
         if selected_topic[0]:
             p = selected_topic[0]["priority"]
-            time_subtitle.value = f"Tema: {selected_topic[0]['name']} · Peso {p} · {p}x XP"
+            time_subtitle.value = f"Tema: {selected_topic[0]['name']}"
             time_subtitle.color = priority_color(p)
         page.update()
 
@@ -122,7 +122,7 @@ def focus_page(page: ft.Page) -> ft.Control:
         btn_start.visible = False
         btn_pause.visible = True
         btn_stop.visible = True
-        session_info.visible = True
+        session_info.visible = False
         dd_topic.disabled = True
         mode_toggle.disabled = True
         pomodoro_section.visible = False
@@ -137,7 +137,7 @@ def focus_page(page: ft.Page) -> ft.Control:
 
     def _stop_timer():
         timer_running[0] = False
-        _finish_session()
+        _reset_timer()
 
     def _reset_timer():
         elapsed_seconds[0] = 0
@@ -159,17 +159,15 @@ def focus_page(page: ft.Page) -> ft.Control:
                     elapsed_seconds[0] += 1
                     _update_display(elapsed_seconds[0])
                     mins = elapsed_seconds[0] / 60
-                    session_xp_text.value = f"{calculate_xp(mins, selected_topic[0]['priority'])} XP"
                 else:
                     elapsed_seconds[0] -= 1
                     _update_display(max(0, elapsed_seconds[0]))
                     total = pomodoro_minutes[0] * 60
                     done = total - elapsed_seconds[0]
                     progress_ring.value = done / total if total > 0 else 0
-                    session_xp_text.value = f"{calculate_xp(done / 60, selected_topic[0]['priority'])} XP"
                     if elapsed_seconds[0] <= 0:
                         timer_running[0] = False
-                        _finish_session()
+                        _reset_timer()
                         return
                 try:
                     page.update()
@@ -178,51 +176,6 @@ def focus_page(page: ft.Page) -> ft.Control:
             time_module.sleep(1)
 
     def _finish_session():
-        if not selected_topic[0]:
-            return
-        if timer_mode[0] == "stopwatch":
-            duration = elapsed_seconds[0] / 60
-        else:
-            duration = (pomodoro_minutes[0] * 60 - max(0, elapsed_seconds[0])) / 60
-        if duration < 0.1:
-            _reset_timer()
-            return
-        xp = calculate_xp(duration, selected_topic[0]["priority"])
-        db.add_session(topic_id=selected_topic[0]["id"], duration_minutes=round(duration, 1),
-                       xp_earned=xp, session_type=timer_mode[0])
-        new_badges = check_badges()
-        stats = db.get_user_stats()
-        lvl = get_level_info(stats["total_xp"])
-
-        badge_controls = []
-        for bid in new_badges:
-            b = get_badge_by_id(bid)
-            if b:
-                badge_controls.append(ft.Container(
-                    content=ft.Row([ft.Icon(b["icon"], color=b["color"], size=20),
-                                    ft.Text(b["name"], size=13, color=Colors.TEXT_PRIMARY)], spacing=6),
-                    bgcolor=b["color"] + "20", border_radius=RADIUS_FULL,
-                    padding=pad_sym(horizontal=12, vertical=6)))
-
-        summary = ft.Column([
-            ft.Icon(ft.Icons.CELEBRATION, color=Colors.ACCENT, size=48),
-            ft.Text("Sessão Concluída!", size=22, weight=ft.FontWeight.BOLD, color=Colors.TEXT_PRIMARY),
-            ft.Row([_chip("Tempo", f"{int(duration)}min", Colors.INFO),
-                    _chip("XP", f"+{xp}", Colors.ACCENT),
-                    _chip("Nível", f"{lvl['level']}", Colors.PRIMARY)],
-                   alignment=ft.MainAxisAlignment.CENTER, spacing=SPACING_SM),
-            ft.ProgressBar(value=lvl["progress"], height=8, color=Colors.PRIMARY,
-                           bgcolor=Colors.SURFACE_HOVER, border_radius=RADIUS_FULL),
-        ] + ([ft.Text("🏆 Nova Conquista!", size=14, color=Colors.WARNING, weight=ft.FontWeight.BOLD),
-              ft.Row(badge_controls, wrap=True)] if badge_controls else []),
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=SPACING_MD)
-
-        dlg = ft.AlertDialog(modal=True, title=ft.Text(""), bgcolor=Colors.BG_DARK, content=summary,
-                             actions=[ft.ElevatedButton("OK", bgcolor=Colors.PRIMARY,
-                                      color=Colors.TEXT_PRIMARY, on_click=lambda e: _close(dlg))],
-                             actions_alignment=ft.MainAxisAlignment.CENTER)
-        page.overlay.append(dlg)
-        dlg.open = True
         _reset_timer()
 
     def _close(dlg):

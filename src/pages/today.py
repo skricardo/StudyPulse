@@ -62,6 +62,7 @@ def today_page(page: ft.Page) -> ft.Control:
                 from src.utils.badges import check_badges
                 duration = slot["planned_minutes"]
                 xp = calculate_xp(duration, slot["priority"])
+                db.undo_planner_quick_log(topic_id=slot["topic_id"], duration_minutes=0) 
                 db.add_session(
                     topic_id=slot["topic_id"],
                     duration_minutes=duration,
@@ -96,6 +97,14 @@ def today_page(page: ft.Page) -> ft.Control:
                 page.data["refresh_header"]()
             _refresh()
         return handler
+    def _delete_session(session_id):
+        def handler(e):
+            db.delete_session(session_id)
+            if page.data and "refresh_header" in page.data:
+                page.data["refresh_header"]()
+            _refresh()
+        return handler
+    
     # ── Rebuild — reconstrói toda a UI com dados frescos ──
     def _rebuild():
         today = date.today()
@@ -235,7 +244,14 @@ def today_page(page: ft.Page) -> ft.Control:
                                 border_radius=RADIUS_FULL,
                                 padding=pad_sym(horizontal=10, vertical=4),
                             ),
-                        ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=SPACING_SM),
+                            ft.IconButton(              
+                                ft.Icons.DELETE_OUTLINE,
+                                icon_color=Colors.DANGER + "80",
+                                icon_size=16,
+                                on_click=_delete_session(s["id"]),
+                                width=28, height=28,
+                            ),
+                        ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=SPACING_SM), 
                         bgcolor=Colors.SURFACE,
                         border_radius=RADIUS_MD,
                         padding=pad_all(12),

@@ -156,8 +156,22 @@ def planner_page(page: ft.Page) -> ft.Control:
         bgcolor=Colors.SURFACE,
         width=200,
     )
-    def _open_edit_slot(slot_id, current_minutes):
+    def _open_edit_slot(slot_id, current_minutes, completed=False):
         def handler(e):
+            if completed:
+                page.snack_bar = ft.SnackBar(
+                    content=ft.Row([
+                        ft.Icon(ft.Icons.LOCK_OUTLINE, color=Colors.WARNING, size=16),
+                        ft.Text(
+                            "Não é possível editar o tempo de uma tarefa já concluída.",
+                            color=Colors.TEXT_PRIMARY,
+                        ),
+                    ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    bgcolor=Colors.SURFACE_HOVER,
+                )
+                page.snack_bar.open = True
+                page.update()
+                return
             edit_slot_id[0] = slot_id
             tf_edit_minutes.value = str(current_minutes)
             tf_edit_minutes.error_text = None
@@ -215,6 +229,7 @@ def planner_page(page: ft.Page) -> ft.Control:
                 
                 duration = slot["planned_minutes"]
                 xp = calculate_xp(duration, slot["priority"])
+                db.undo_planner_quick_log(topic_id=slot["topic_id"], duration_minutes=0)
                 db.add_session(
                     topic_id=slot["topic_id"],
                     duration_minutes=duration,
@@ -351,9 +366,11 @@ def planner_page(page: ft.Page) -> ft.Control:
                         ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                         ft.Row([
                             ft.TextButton(
-                                f"{s['planned_minutes']}min ✏️",
-                                style=ft.ButtonStyle(color=Colors.TEXT_SECONDARY),
-                                on_click=_open_edit_slot(s["id"], s["planned_minutes"]),
+                                f"{s['planned_minutes']}min" + (" 🔒" if s["completed"] else " ✏️"),
+                                style=ft.ButtonStyle(
+                                    color=Colors.TEXT_MUTED if s["completed"] else Colors.TEXT_SECONDARY
+                                ),
+                                on_click=_open_edit_slot(s["id"], s["planned_minutes"], bool(s["completed"])),
                             ),
                             ft.Checkbox(
                                 value=bool(s["completed"]),

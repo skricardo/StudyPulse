@@ -318,15 +318,29 @@ def add_session(topic_id: int, duration_minutes: float, xp_earned: int,
     conn.close()
     return session_id
 
+def delete_session(session_id: int) -> int:
+    """Apaga uma sessão e desconta o XP. Retorna o XP descontado."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT xp_earned FROM study_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    xp = 0
+    if row:
+        xp = row["xp_earned"]
+        conn.execute("DELETE FROM study_sessions WHERE id = ?", (session_id,))
+        conn.execute("UPDATE user_stats SET total_xp = MAX(0, total_xp - ?) WHERE id = 1", (xp,))
+        conn.commit()
+    conn.close()
+    return xp
 
 def undo_planner_quick_log(topic_id: int, duration_minutes: float) -> int:
     """Finds the most recent quick log session for this topic/duration and deletes it, undoing the XP."""
     conn = get_connection()
     row = conn.execute(
         "SELECT id, xp_earned FROM study_sessions "
-        "WHERE session_type = 'planner_quick_log' AND topic_id = ? AND duration_minutes = ? "
+        "WHERE session_type = 'planner_quick_log' AND topic_id = ? "
         "ORDER BY id DESC LIMIT 1",
-        (topic_id, duration_minutes)
+        (topic_id,)
     ).fetchone()
     
     xp_deducted = 0
