@@ -15,6 +15,13 @@ DAY_NAMES = ["Segunda-feira", "Terça-feira", "Quarta-feira",
              "Quinta-feira", "Sexta-feira", "Sábado", "Domingo"]
 MONTH_NAMES = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
                "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+REMINDER_CATEGORIES = [
+    ("general", "Geral", ft.Icons.PUSH_PIN),
+    ("email", "Email", ft.Icons.EMAIL),
+    ("call", "Ligação", ft.Icons.PHONE),
+    ("document", "Documento", ft.Icons.DESCRIPTION),
+    ("alarm", "Alarme", ft.Icons.ALARM),
+]
 def _greeting():
     """Retorna saudação baseada no horário."""
     hour = datetime.now().hour
@@ -48,7 +55,6 @@ def _kpi_chip(emoji, label, value, color):
 # ─── Page ─────────────────────────────────────────────────────────
 def today_page(page: ft.Page) -> ft.Control:
     """Build the today/daily dashboard page."""
-    # Container principal — será reconstruído ao clicar nos checkboxes
     main_content = ft.Column(spacing=SPACING_LG, scroll=ft.ScrollMode.AUTO, expand=True)
     # ── Toggle slot (marcar/desmarcar conclusão) ──
     def _toggle_slot(slot_id):
@@ -62,14 +68,24 @@ def today_page(page: ft.Page) -> ft.Control:
                 from src.utils.badges import check_badges
                 duration = slot["planned_minutes"]
                 xp = calculate_xp(duration, slot["priority"])
-                db.undo_planner_quick_log(topic_id=slot["topic_id"], duration_minutes=0) 
+                slot_date = (
+                    date.fromisoformat(slot["week_start_date"])
+                    + timedelta(days=slot["day_of_week"])
+                ).isoformat()
+                db.undo_planner_quick_log(topic_id=slot["topic_id"], duration_minutes=0, session_date=slot_date)
                 db.add_session(
                     topic_id=slot["topic_id"],
                     duration_minutes=duration,
                     xp_earned=xp,
                     session_type="planner_quick_log",
-                    notes="Concluído via Today"
+                    notes="Concluído via Today",
+                    session_date=slot_date,
                 )
+                # Mover para o fim do grupo de concluídos
+                completed_count = db.get_completed_count_for_day(
+                    slot["day_of_week"], slot["week_start_date"], slot_id
+                )
+                db.update_planner_slot(slot_id, sort_order=completed_count)
                 new_badges = check_badges()
                 msg = f"Sessão registrada: {duration}min (+{xp} XP)"
                 if new_badges:
@@ -80,11 +96,18 @@ def today_page(page: ft.Page) -> ft.Control:
                 )
                 page.snack_bar.open = True
             else:
+                slot_date = (
+                    date.fromisoformat(slot["week_start_date"])
+                    + timedelta(days=slot["day_of_week"])
+                ).isoformat()
                 duration = slot["planned_minutes"]
                 xp_deducted = db.undo_planner_quick_log(
                     topic_id=slot["topic_id"],
-                    duration_minutes=duration
+                    duration_minutes=duration,
+                    session_date=slot_date,
                 )
+                # Mandar para o fim da lista (abaixo dos pendentes)
+                db.update_planner_slot(slot_id, sort_order=9999)
                 if xp_deducted > 0:
                     page.snack_bar = ft.SnackBar(
                         content=ft.Text(
@@ -104,17 +127,160 @@ def today_page(page: ft.Page) -> ft.Control:
                 page.data["refresh_header"]()
             _refresh()
         return handler
-    
+    # ── Reminder state (persistente entre rebuilds) ──
+    tf_reminder = ft.TextField(
+        hint_text="Novo lembrete...",
+        border_color=Colors.TEXT_MUTED,
+        color=Colors.TEXT_PRIMARY,
+        hint_style=ft.TextStyle(color=Colors.TEXT_MUTED),
+        bgcolor=Colors.SURFACE,
+        expand=True,
+        height=42,
+        border_radius=RADIUS_MD,
+        on_submit=lambda e: _add_reminder(e),
+    )
+    dd_category = ft.Dropdown(
+        value="general",
+        border_color=Colors.TEXT_MUTED,
+        color=Colors.TEXT_PRIMARY,
+        bgcolor=Colors.SURFACE,
+        width=110,
+        height=42,
+        options=[ft.dropdown.Option(key=c[0], text=c[1]) for c in REMINDER_CATEGORIES],
+    )
+    reminders_list = ft.Column(spacing=6)
+    def _add_reminder(e):
+        text = tf_reminder.value.strip()
+        if not text:
+            return
+        db.add_reminder(text=text, category=dd_category.value or "general")
+        tf_reminder.value = ""
+        _refresh()
+    def _toggle_reminder(rid):
+        def handler(e):
+            db.toggle_reminder(rid)
+            _refresh()
+        return handler
+
+    # ── Confirm Delete Reminder ──
+    _confirm_rid = [None]
+    def _close_confirm_reminder():
+        dlg_confirm_reminder.open = False
+        page.update()
+    def _do_delete_reminder():
+        if _confirm_rid[0] is not None:
+            db.delete_reminder(_confirm_rid[0])
+            _confirm_rid[0] = None
+        dlg_confirm_reminder.open = False
+        _refresh()
+    dlg_confirm_reminder = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Apagar Lembrete?", color=Colors.TEXT_PRIMARY, weight=ft.FontWeight.BOLD),
+        bgcolor=Colors.BG_DARK,
+        content=ft.Text(
+            "Tem certeza que deseja apagar este lembrete?\nEsta ação não pode ser desfeita.",
+            color=Colors.TEXT_SECONDARY, size=13,
+        ),
+        actions=[
+            ft.TextButton("Cancelar", on_click=lambda e: _close_confirm_reminder(),
+                          style=ft.ButtonStyle(color=Colors.TEXT_SECONDARY)),
+            ft.ElevatedButton("Apagar", on_click=lambda e: _do_delete_reminder(),
+                              bgcolor=Colors.DANGER, color=Colors.TEXT_PRIMARY),
+        ],
+    )
+    page.overlay.append(dlg_confirm_reminder)
+
+    def _delete_reminder(rid):
+        def handler(e):
+            _confirm_rid[0] = rid
+            dlg_confirm_reminder.open = True
+            page.update()
+        return handler
+    def _rebuild_reminders_list():
+        reminders_list.controls.clear()
+        reminders = db.get_reminders(show_completed=False)
+        if not reminders:
+            reminders_list.controls.append(
+                ft.Container(
+                    content=ft.Column([
+                        ft.Icon(ft.Icons.PUSH_PIN, color=Colors.TEXT_MUTED, size=28),
+                        ft.Text("Nenhum lembrete pendente", size=13, color=Colors.TEXT_MUTED),
+                        ft.Text(
+                            "Lembretes concluídos ficam\nvisíveis no Planner →",
+                            size=11, color=Colors.TEXT_MUTED,
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6),
+                    padding=pad_sym(vertical=SPACING_LG),
+                    alignment=ft.alignment.center,
+                )
+            )
+        for r in reminders:
+            cat_icon = ft.Icons.PUSH_PIN
+            for c in REMINDER_CATEGORIES:
+                if c[0] == r["category"]:
+                    cat_icon = c[2]
+                    break
+            reminders_list.controls.append(
+                ft.Container(
+                    content=ft.Row([
+                        ft.Checkbox(
+                            value=False,
+                            on_change=_toggle_reminder(r["id"]),
+                            active_color=Colors.ACCENT,
+                            scale=0.85,
+                        ),
+                        ft.Icon(cat_icon, color=Colors.TEXT_MUTED, size=16),
+                        ft.Text(
+                            r["text"], size=13,
+                            color=Colors.TEXT_PRIMARY,
+                            expand=True,
+                        ),
+                        ft.IconButton(
+                            ft.Icons.DELETE_OUTLINE,
+                            icon_color=Colors.DANGER + "80",
+                            icon_size=16,
+                            on_click=_delete_reminder(r["id"]),
+                            width=28, height=28,
+                        ),
+                    ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=4),
+                    bgcolor=Colors.SURFACE,
+                    border_radius=RADIUS_MD,
+                    padding=pad_sym(horizontal=8, vertical=4),
+                    border=border_all(1, "#ffffff08"),
+                )
+            )
+    reminders_panel = ft.Container(
+        content=ft.Column([
+            ft.Row([
+                ft.Icon(ft.Icons.PUSH_PIN, color=Colors.WARNING, size=20),
+                ft.Text("Lembretes", size=16, weight=ft.FontWeight.BOLD,
+                        color=Colors.TEXT_PRIMARY),
+            ], spacing=SPACING_SM),
+            ft.Row([
+                tf_reminder,
+                dd_category,
+                ft.IconButton(
+                    ft.Icons.ADD_CIRCLE,
+                    icon_color=Colors.ACCENT,
+                    icon_size=28,
+                    on_click=_add_reminder,
+                ),
+            ], spacing=SPACING_SM),
+            reminders_list,
+        ], spacing=SPACING_MD),
+        **card_style(),
+        expand=1,
+    )
     # ── Rebuild — reconstrói toda a UI com dados frescos ──
     def _rebuild():
         today = date.today()
         today_str = today.isoformat()
-        # Buscar dados
         week_start = db.get_week_start(today)
         day_of_week = today.weekday()
         slots = db.get_day_planner_slots(day_of_week, week_start)
         sessions = db.get_sessions_for_date(today_str)
-        # Calcular KPIs
+        # KPIs
         total_minutes = sum(s["duration_minutes"] for s in sessions)
         total_xp = sum(s["xp_earned"] for s in sessions)
         total_sessions = len(sessions)
@@ -244,14 +410,14 @@ def today_page(page: ft.Page) -> ft.Control:
                                 border_radius=RADIUS_FULL,
                                 padding=pad_sym(horizontal=10, vertical=4),
                             ),
-                            ft.IconButton(              
+                            ft.IconButton(
                                 ft.Icons.DELETE_OUTLINE,
                                 icon_color=Colors.DANGER + "80",
                                 icon_size=16,
                                 on_click=_delete_session(s["id"]),
                                 width=28, height=28,
                             ),
-                        ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=SPACING_SM), 
+                        ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=SPACING_SM),
                         bgcolor=Colors.SURFACE,
                         border_radius=RADIUS_MD,
                         padding=pad_all(12),
@@ -331,14 +497,29 @@ def today_page(page: ft.Page) -> ft.Control:
             )
         else:
             topics_card = ft.Container()
+        # Reconstruir lista de lembretes
+        _rebuild_reminders_list()
+        # Coluna esquerda: Agenda + Sessões
+        left_col = ft.Column(
+            [agenda_card, sessions_card],
+            spacing=SPACING_LG,
+            expand=1,
+        )
         # Montar página
-        children = [header_card, kpi_row, agenda_card, sessions_card]
-        if sessions:
-            children.append(topics_card)
-        main_content.controls.extend(children)
-    # ── Refresh — limpa e reconstrói ──
-    def _refresh():
         main_content.controls.clear()
+        main_content.controls.extend([
+            header_card,
+            kpi_row,
+            ft.Row(
+                [left_col, reminders_panel],
+                spacing=SPACING_LG,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            ),
+        ])
+        if sessions:
+            main_content.controls.append(topics_card)
+    # ── Refresh — reconstrói toda a UI com dados frescos ──
+    def _refresh():
         _rebuild()
         page.update()
     # Primeira construção

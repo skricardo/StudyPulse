@@ -44,7 +44,7 @@ def planner_page(page: ft.Page) -> ft.Control:
         nonlocal slots_data, reminders_data
         ws = _week_start().isoformat()
         slots_data = db.get_planner_slots(ws)
-        reminders_data = db.get_reminders()
+        reminders_data = db.get_reminders(show_completed=True)
         _rebuild_grid()
         _rebuild_reminders()
         page.update()
@@ -111,7 +111,17 @@ def planner_page(page: ft.Page) -> ft.Control:
             
         tf_minutes.error_text = None
         start_date = _week_start()
-
+        # Verificar se o tema já existe neste dia/semana
+        existing = db.get_planner_slots(start_date.isoformat())
+        already_exists = any(
+            s["topic_id"] == t_id and s["day_of_week"] == d_val
+            for s in existing
+        )
+        if already_exists:
+            dd_topic.error_text = "Este tema já está adicionado neste dia"
+            page.update()
+            return
+        dd_topic.error_text = None
         db.add_planner_slot(
             topic_id=t_id,
             day_of_week=d_val,
@@ -156,22 +166,8 @@ def planner_page(page: ft.Page) -> ft.Control:
         bgcolor=Colors.SURFACE,
         width=200,
     )
-    def _open_edit_slot(slot_id, current_minutes, completed=False):
+    def _open_edit_slot(slot_id, current_minutes):
         def handler(e):
-            if completed:
-                page.snack_bar = ft.SnackBar(
-                    content=ft.Row([
-                        ft.Icon(ft.Icons.LOCK_OUTLINE, color=Colors.WARNING, size=16),
-                        ft.Text(
-                            "Não é possível editar o tempo de uma tarefa já concluída.",
-                            color=Colors.TEXT_PRIMARY,
-                        ),
-                    ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                    bgcolor=Colors.SURFACE_HOVER,
-                )
-                page.snack_bar.open = True
-                page.update()
-                return
             edit_slot_id[0] = slot_id
             tf_edit_minutes.value = str(current_minutes)
             tf_edit_minutes.error_text = None
@@ -226,36 +222,50 @@ def planner_page(page: ft.Page) -> ft.Control:
             if is_checked:
                 from src.utils.xp_system import calculate_xp
                 from src.utils.badges import check_badges
-                
+                from datetime import date, timedelta
                 duration = slot["planned_minutes"]
                 xp = calculate_xp(duration, slot["priority"])
-                db.undo_planner_quick_log(topic_id=slot["topic_id"], duration_minutes=0)
+                slot_date = (
+                    date.fromisoformat(slot["week_start_date"])
+                    + timedelta(days=slot["day_of_week"])
+                ).isoformat()
+                db.undo_planner_quick_log(topic_id=slot["topic_id"], duration_minutes=0, session_date=slot_date)
                 db.add_session(
                     topic_id=slot["topic_id"],
                     duration_minutes=duration,
                     xp_earned=xp,
                     session_type="planner_quick_log",
-                    notes="Concluído via Planner"
+                    notes="Concluído via Planner",
+                    session_date=slot_date,
                 )
-                
+                # Mover para o fim do grupo de concluídos
+                completed_count = db.get_completed_count_for_day(
+                    slot["day_of_week"], slot["week_start_date"], slot_id
+                )
+                db.update_planner_slot(slot_id, sort_order=completed_count)
                 new_badges = check_badges()
                 msg = f"Sessão registrada: {duration}min (+{xp} XP)"
                 if new_badges:
                     msg += " 🏆 Conquista desbloqueada!"
-                    
                 page.snack_bar = ft.SnackBar(
                     content=ft.Text(msg, color=Colors.TEXT_PRIMARY),
                     bgcolor=Colors.SURFACE_HOVER,
                 )
                 page.snack_bar.open = True
-
             else:
+                from datetime import date, timedelta
+                slot_date = (
+                    date.fromisoformat(slot["week_start_date"])
+                    + timedelta(days=slot["day_of_week"])
+                ).isoformat()
                 duration = slot["planned_minutes"]
                 xp_deducted = db.undo_planner_quick_log(
                     topic_id=slot["topic_id"],
-                    duration_minutes=duration
+                    duration_minutes=duration,
+                    session_date=slot_date,
                 )
-                
+                # Mandar para o fim da lista (abaixo dos pendentes)
+                db.update_planner_slot(slot_id, sort_order=9999)
                 if xp_deducted > 0:
                     page.snack_bar = ft.SnackBar(
                         content=ft.Text(f"Sessão desfeita. {duration}min removidos (-{xp_deducted} XP)", color=Colors.TEXT_PRIMARY),
@@ -366,11 +376,13 @@ def planner_page(page: ft.Page) -> ft.Control:
                         ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                         ft.Row([
                             ft.TextButton(
-                                f"{s['planned_minutes']}min" + (" 🔒" if s["completed"] else " ✏️"),
+                                f"{s['planned_minutes']}min {'🔒' if s['completed'] else '✏️'}",
                                 style=ft.ButtonStyle(
-                                    color=Colors.TEXT_MUTED if s["completed"] else Colors.TEXT_SECONDARY
+                                    color=Colors.TEXT_MUTED if s["completed"] else Colors.TEXT_SECONDARY,
                                 ),
-                                on_click=_open_edit_slot(s["id"], s["planned_minutes"], bool(s["completed"])),
+                                on_click=None if s["completed"] else _open_edit_slot(s["id"], s["planned_minutes"]),
+                                tooltip="Desmarque como concluído para editar" if s["completed"] else None,
+                                disabled=bool(s["completed"]),
                             ),
                             ft.Checkbox(
                                 value=bool(s["completed"]),
@@ -387,16 +399,26 @@ def planner_page(page: ft.Page) -> ft.Control:
                     opacity=0.6 if s["completed"] else 1.0,
                 )
                 
-                draggable_card = ft.Draggable(
-                    group="planner_slots",
-                    data=s["id"],
-                    content=ft.DragTarget(
+                if s["completed"]:
+                    # Slot concluído: não é arrastável, mas ainda aceita drops
+                    draggable_card = ft.DragTarget(
                         group="planner_slots",
                         data={"type": "slot", "day": i, "slot_id": s["id"]},
                         content=card_content,
                         on_accept=_on_slot_drop,
                     )
-                )
+                else:
+                    # Slot pendente: arrastável normalmente
+                    draggable_card = ft.Draggable(
+                        group="planner_slots",
+                        data=s["id"],
+                        content=ft.DragTarget(
+                            group="planner_slots",
+                            data={"type": "slot", "day": i, "slot_id": s["id"]},
+                            content=card_content,
+                            on_accept=_on_slot_drop,
+                        )
+                    )
                 slot_cards.append(draggable_card)
 
             col = ft.Container(
@@ -479,11 +501,39 @@ def planner_page(page: ft.Page) -> ft.Control:
             db.toggle_reminder(rid)
             _refresh()
         return handler
-
+    # ── Confirm Delete Reminder ──
+    _confirm_rid = [None]
+    def _close_confirm_reminder():
+        dlg_confirm_reminder.open = False
+        page.update()
+    def _do_delete_reminder():
+        if _confirm_rid[0] is not None:
+            db.delete_reminder(_confirm_rid[0])
+            _confirm_rid[0] = None
+        dlg_confirm_reminder.open = False
+        _refresh()
+    dlg_confirm_reminder = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Apagar Lembrete?", color=Colors.TEXT_PRIMARY, weight=ft.FontWeight.BOLD),
+        bgcolor=Colors.BG_DARK,
+        content=ft.Text(
+            "Tem certeza que deseja apagar este lembrete?\nEsta ação não pode ser desfeita.",
+            color=Colors.TEXT_SECONDARY, size=13,
+        ),
+        actions=[
+            ft.TextButton("Cancelar", on_click=lambda e: _close_confirm_reminder(),
+                          style=ft.ButtonStyle(color=Colors.TEXT_SECONDARY)),
+            ft.ElevatedButton("Apagar", on_click=lambda e: _do_delete_reminder(),
+                              bgcolor=Colors.DANGER, color=Colors.TEXT_PRIMARY),
+        ],
+    )
+    page.overlay.append(dlg_confirm_reminder)
+    
     def _delete_reminder(rid):
         def handler(e):
-            db.delete_reminder(rid)
-            _refresh()
+            _confirm_rid[0] = rid
+            dlg_confirm_reminder.open = True
+            page.update()
         return handler
 
     def _rebuild_reminders():

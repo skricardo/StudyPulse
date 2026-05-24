@@ -237,7 +237,7 @@ def get_planner_slots(week_start: str):
         "FROM planner_slots ps "
         "JOIN topics t ON ps.topic_id = t.id "
         "WHERE ps.week_start_date = ? "
-        "ORDER BY ps.day_of_week, ps.sort_order, t.priority DESC",
+        "ORDER BY ps.day_of_week, ps.completed DESC, ps.sort_order, t.priority DESC",
         (week_start,),
     ).fetchall()
     conn.close()
@@ -260,7 +260,7 @@ def add_planner_slot(topic_id: int, day_of_week: int, planned_minutes: int, week
 
 def update_planner_slot(slot_id: int, **kwargs):
     """Update a planner slot."""
-    allowed = {"planned_minutes", "completed"}
+    allowed = {"planned_minutes", "completed", "sort_order"}
     fields = {k: v for k, v in kwargs.items() if k in allowed}
     if not fields:
         return
@@ -297,14 +297,19 @@ def delete_planner_slot(slot_id: int):
 # ─── Study Sessions ──────────────────────────────────────────────
 
 def add_session(topic_id: int, duration_minutes: float, xp_earned: int,
-                session_type: str = "stopwatch", notes: str = "") -> int:
+                session_type: str = "stopwatch", notes: str = "",
+                session_date: str | None = None) -> int:
     """Record a completed study session."""
-    now = datetime.now().isoformat()
+    now = datetime.now()
+    if session_date:
+        dt_str = f"{session_date}T{now.strftime('%H:%M:%S')}"
+    else:
+        dt_str = now.isoformat()
     conn = get_connection()
     cursor = conn.execute(
         "INSERT INTO study_sessions (topic_id, start_time, end_time, duration_minutes, "
         "xp_earned, session_type, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (topic_id, now, now, duration_minutes, xp_earned, session_type, notes),
+        (topic_id, dt_str, dt_str, duration_minutes, xp_earned, session_type, notes),
     )
     session_id = cursor.lastrowid
 
@@ -333,16 +338,24 @@ def delete_session(session_id: int) -> int:
     conn.close()
     return xp
 
-def undo_planner_quick_log(topic_id: int, duration_minutes: float) -> int:
-    """Finds the most recent quick log session for this topic/duration and deletes it, undoing the XP."""
+def undo_planner_quick_log(topic_id: int, duration_minutes: float, session_date: str | None = None) -> int:
+    """Finds the quick log session for this topic/date and deletes it, undoing the XP."""
     conn = get_connection()
-    row = conn.execute(
-        "SELECT id, xp_earned FROM study_sessions "
-        "WHERE session_type = 'planner_quick_log' AND topic_id = ? "
-        "ORDER BY id DESC LIMIT 1",
-        (topic_id,)
-    ).fetchone()
-    
+    if session_date:
+        row = conn.execute(
+            "SELECT id, xp_earned FROM study_sessions "
+            "WHERE session_type = 'planner_quick_log' AND topic_id = ? "
+            "AND date(start_time) = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (topic_id, session_date)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id, xp_earned FROM study_sessions "
+            "WHERE session_type = 'planner_quick_log' AND topic_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (topic_id,)
+        ).fetchone()
     xp_deducted = 0
     if row:
         session_id = row["id"]
@@ -438,12 +451,22 @@ def get_day_planner_slots(day_of_week: int, week_start: str):
         "FROM planner_slots ps "
         "JOIN topics t ON ps.topic_id = t.id "
         "WHERE ps.day_of_week = ? AND ps.week_start_date = ? "
-        "ORDER BY ps.sort_order, t.priority DESC",
+        "ORDER BY ps.completed DESC, ps.sort_order, t.priority DESC",
         (day_of_week, week_start),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
+def get_completed_count_for_day(day_of_week: int, week_start: str, slot_id: int) -> int:
+    """Conta quantos slots concluídos existem num dia, excluindo o slot informado."""
+    conn = get_connection()
+    count = conn.execute(
+        "SELECT COUNT(*) FROM planner_slots "
+        "WHERE day_of_week = ? AND week_start_date = ? AND completed = 1 AND id != ?",
+        (day_of_week, week_start, slot_id)
+    ).fetchone()[0]
+    conn.close()
+    return count
 
 
 
