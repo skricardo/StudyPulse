@@ -6,12 +6,33 @@ import sqlite3
 import os
 from datetime import datetime, date
 
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "studypulse.db")
-
-
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+_DEFAULT_DB = os.path.join(BASE_DIR, "studypulse.db")
+_current_db = [_DEFAULT_DB]
+def set_user_db(username: str):
+    """
+    Define o banco de dados para o usuário logado.
+    Só migra o banco legado se ele realmente contiver este usuário.
+    """
+    user_db = os.path.join(BASE_DIR, f"studypulse_{username.strip().lower()}.db")
+    if not os.path.exists(user_db) and os.path.exists(_DEFAULT_DB):
+        # Verificar se o banco legado pertence a este usuário antes de migrar
+        try:
+            import sqlite3 as _sq
+            _conn = _sq.connect(_DEFAULT_DB)
+            row = _conn.execute(
+                "SELECT username FROM users WHERE username = ? COLLATE NOCASE LIMIT 1",
+                (username,)
+            ).fetchone()
+            _conn.close()
+            if row:
+                os.rename(_DEFAULT_DB, user_db)
+        except Exception:
+            pass
+    _current_db[0] = user_db
 def get_connection() -> sqlite3.Connection:
     """Get a database connection with row_factory enabled."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(_current_db[0])
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -82,6 +103,23 @@ def init_db():
             streak_freeze_available INTEGER NOT NULL DEFAULT 0,
             last_study_date TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            password_hash TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            expires_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
     """)
 
     # Ensure user_stats has exactly 1 row
@@ -117,7 +155,15 @@ def init_db():
             cursor.execute("UPDATE categories SET sort_order = ? WHERE id = ?", (i, row["id"]))
     except Exception:
         pass
-
+    # Migração: adicionar pergunta e resposta secreta em users
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN security_question TEXT")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN security_answer_hash TEXT")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -400,7 +446,6 @@ def get_daily_minutes(days: int = 365):
     conn.close()
     return {row["study_date"]: row["total_min"] for row in rows}
 
-
 def get_topic_totals():
     """Get total minutes studied per topic (all time)."""
     conn = get_connection()
@@ -410,7 +455,39 @@ def get_topic_totals():
         "FROM topics t "
         "LEFT JOIN study_sessions ss ON t.id = ss.topic_id "
         "WHERE t.archived = 0 "
-        "GROUP BY t.id ORDER BY total_minutes DESC"
+        "GROUP BY t.id HAVING total_minutes > 0 ORDER BY total_minutes DESC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_topic_totals_monthly():
+    """Get total minutes studied per topic for the current month."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT t.id, t.name, t.color, "
+        "COALESCE(SUM(ss.duration_minutes), 0) as total_minutes "
+        "FROM topics t "
+        "LEFT JOIN study_sessions ss ON t.id = ss.topic_id "
+        "   AND strftime('%Y-%m', ss.start_time) = strftime('%Y-%m', 'now', 'localtime') "
+        "WHERE t.archived = 0 "
+        "GROUP BY t.id HAVING total_minutes > 0 ORDER BY total_minutes DESC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+    
+def get_topic_totals_weekly(week_start: str):
+    """Get total minutes studied per topic for a specific week."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT t.id, t.name, t.color, "
+        "COALESCE(SUM(ss.duration_minutes), 0) as total_minutes "
+        "FROM topics t "
+        "LEFT JOIN study_sessions ss ON t.id = ss.topic_id "
+        "   AND date(ss.start_time) >= ? AND date(ss.start_time) < date(?, '+7 days') "
+        "WHERE t.archived = 0 "
+        "GROUP BY t.id HAVING total_minutes > 0 ORDER BY total_minutes DESC",
+        (week_start, week_start)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -572,3 +649,89 @@ def _update_streak(conn: sqlite3.Connection):
         "WHERE id = 1",
         (new_streak, best, today),
     )
+
+# ─── Users & Auth ────────────────────────────────────────────────
+def create_user(username: str, password_hash: str, display_name: str,
+                security_question: str = "", security_answer_hash: str = "") -> int | None:
+    """Cria um novo usuário. Retorna o id ou None se username já existe."""
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO users (username, password_hash, display_name, security_question, security_answer_hash) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (username, password_hash, display_name, security_question, security_answer_hash),
+        )
+        user_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return user_id
+    except sqlite3.IntegrityError:
+        conn.close()
+        return None
+def get_user_by_username(username: str) -> dict | None:
+    """Busca um usuário pelo username (case-insensitive)."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+def create_session(user_id: int, token: str, expires_at: str) -> int:
+    """Cria uma sessão persistente para o usuário."""
+    conn = get_connection()
+    cursor = conn.execute(
+        "INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)",
+        (user_id, token, expires_at),
+    )
+    session_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return session_id
+def get_session_by_token(token: str) -> dict | None:
+    """Busca uma sessão pelo token, retorna None se expirada ou inexistente."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT s.*, u.username, u.display_name "
+        "FROM sessions s JOIN users u ON s.user_id = u.id "
+        "WHERE s.token = ? AND s.expires_at > datetime('now', 'localtime')",
+        (token,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+def delete_session_by_token(token: str):
+    """Remove uma sessão (logout)."""
+    conn = get_connection()
+    conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+
+def get_security_question(username: str) -> str | None:
+    """Retorna a pergunta secreta do usuário, ou None se não encontrado."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT security_question FROM users WHERE username = ? COLLATE NOCASE",
+        (username,)
+    ).fetchone()
+    conn.close()
+    if row and row["security_question"]:
+        return row["security_question"]
+    return None
+def update_user_password(user_id: int, new_password_hash: str):
+    """Redefine a senha do usuário."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE users SET password_hash = ? WHERE id = ?",
+        (new_password_hash, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+def update_user_security_question(user_id: int, question: str, answer_hash: str):
+    """Salva ou atualiza a pergunta e resposta secreta do usuário."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE users SET security_question = ?, security_answer_hash = ? WHERE id = ?",
+        (question, answer_hash, user_id)
+    )
+    conn.commit()
+    conn.close()

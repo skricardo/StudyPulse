@@ -49,6 +49,14 @@ def planner_page(page: ft.Page) -> ft.Control:
         _rebuild_reminders()
         page.update()
 
+    dd_category_filter = ft.Dropdown(
+        label="Categoria",
+        border_color=Colors.TEXT_MUTED,
+        color=Colors.TEXT_PRIMARY,
+        label_style=ft.TextStyle(color=Colors.TEXT_SECONDARY),
+        bgcolor=Colors.SURFACE,
+        width=280,
+    )
     # ── Add Slot Dialog ──
     dd_topic = ft.Dropdown(
         label="Tema",
@@ -85,13 +93,23 @@ def planner_page(page: ft.Page) -> ft.Control:
     )
 
     def _open_add_slot(e):
-        topics = db.get_topics()
-        dd_topic.options = [
-            ft.dropdown.Option(key=str(t["id"]), text=f"{t['name']} (P{t['priority']})")
-            for t in topics
+        categories = db.get_categories()
+        dd_category_filter.options = [
+            ft.dropdown.Option(key=cat, text=cat) for cat in categories
         ]
-        if topics:
-            dd_topic.value = str(topics[0]["id"])
+        dd_category_filter.value = categories[0] if categories else None
+        def _update_topics_by_category(e=None):
+            selected_cat = dd_category_filter.value
+            topics = db.get_topics()
+            filtered = [t for t in topics if t["category"] == selected_cat]
+            dd_topic.options = [
+                ft.dropdown.Option(key=str(t["id"]), text=f"{t['name']} (P{t['priority']})")
+                for t in filtered
+            ]
+            dd_topic.value = str(filtered[0]["id"]) if filtered else None
+            page.update()
+        dd_category_filter.on_change = _update_topics_by_category
+        _update_topics_by_category()
         dd_day.value = str(today.weekday())
         tf_minutes.value = "0"
         cb_repeat_month.value = False
@@ -145,7 +163,7 @@ def planner_page(page: ft.Page) -> ft.Control:
         modal=True,
         title=ft.Text("Adicionar ao Planner", color=Colors.TEXT_PRIMARY, weight=ft.FontWeight.BOLD),
         bgcolor=Colors.BG_DARK,
-        content=ft.Column([dd_topic, dd_day, tf_minutes, cb_repeat_month], spacing=SPACING_MD, tight=True),
+        content=ft.Column([dd_category_filter, dd_topic, dd_day, tf_minutes, cb_repeat_month], spacing=SPACING_MD, tight=True),
         actions=[
             ft.TextButton("Cancelar", on_click=lambda e: _close_dialog(dlg_add_slot),
                           style=ft.ButtonStyle(color=Colors.TEXT_SECONDARY)),
@@ -203,26 +221,124 @@ def planner_page(page: ft.Page) -> ft.Control:
         page.update()
 
     # ── Delete Slot ──
+    _confirm_slot_id = [None]
+    def _close_confirm_slot():
+        dlg_confirm_slot.open = False
+        page.update()
+    def _do_delete_slot():
+        if _confirm_slot_id[0] is not None:
+            db.delete_planner_slot(_confirm_slot_id[0])
+            _confirm_slot_id[0] = None
+        dlg_confirm_slot.open = False
+        _refresh()
+    dlg_confirm_slot = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Remover tema?", color=Colors.TEXT_PRIMARY, weight=ft.FontWeight.BOLD),
+        bgcolor=Colors.BG_DARK,
+        content=ft.Text(
+            "Tem certeza que deseja remover este tema do planner?\nEsta ação não pode ser desfeita.",
+            color=Colors.TEXT_SECONDARY, size=13,
+        ),
+        actions=[
+            ft.TextButton("Cancelar", on_click=lambda e: _close_confirm_slot(),
+                          style=ft.ButtonStyle(color=Colors.TEXT_SECONDARY)),
+            ft.ElevatedButton("Remover", on_click=lambda e: _do_delete_slot(),
+                              bgcolor=Colors.DANGER, color=Colors.TEXT_PRIMARY),
+        ],
+    )
+    page.overlay.append(dlg_confirm_slot)
+
+    # ── Confirm Uncheck Past Slot ──
+    _confirm_uncheck_id = [None]
+    def _close_confirm_uncheck():
+        dlg_confirm_uncheck.open = False
+        _refresh()
+    def _do_uncheck_slot():
+        slot_id = _confirm_uncheck_id[0]
+        if slot_id is None:
+            dlg_confirm_uncheck.open = False
+            page.update()
+            return
+        from datetime import date, timedelta
+        slot = db.get_planner_slot_by_id(slot_id)
+        if slot:
+            slot_date = (
+                date.fromisoformat(slot["week_start_date"])
+                + timedelta(days=slot["day_of_week"])
+            ).isoformat()
+            duration = slot["planned_minutes"]
+            db.update_planner_slot(slot_id, completed=0)
+            xp_deducted = db.undo_planner_quick_log(
+                topic_id=slot["topic_id"],
+                duration_minutes=duration,
+                session_date=slot_date,
+            )
+            db.update_planner_slot(slot_id, sort_order=9999)
+            if xp_deducted > 0:
+                page.snack_bar = ft.SnackBar(
+                    content=ft.Text(
+                        f"Sessão desfeita. {duration}min removidos (-{xp_deducted} XP)",
+                        color=Colors.TEXT_PRIMARY),
+                    bgcolor=Colors.SURFACE_HOVER,
+                )
+                page.snack_bar.open = True
+            if page.data and "refresh_header" in page.data:
+                page.data["refresh_header"]()
+        _confirm_uncheck_id[0] = None
+        dlg_confirm_uncheck.open = False
+        _refresh()
+    dlg_confirm_uncheck = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Desfazer conclusão?", color=Colors.TEXT_PRIMARY,
+                      weight=ft.FontWeight.BOLD),
+        bgcolor=Colors.BG_DARK,
+        content=ft.Text(
+            "Esta atividade foi concluída em um dia anterior.\n"
+            "Desmarcar irá apagar a sessão e o XP ganho.\n\n"
+            "Tem certeza que deseja continuar?",
+            color=Colors.TEXT_SECONDARY, size=13,
+        ),
+        actions=[
+            ft.TextButton("Cancelar", on_click=lambda e: _close_confirm_uncheck(),
+                          style=ft.ButtonStyle(color=Colors.TEXT_SECONDARY)),
+            ft.ElevatedButton("Sim, desfazer", on_click=lambda e: _do_uncheck_slot(),
+                              bgcolor=Colors.DANGER, color=Colors.TEXT_PRIMARY),
+        ],
+    )
+    page.overlay.append(dlg_confirm_uncheck)
+
     def _delete_slot(slot_id):
         def handler(e):
-            db.delete_planner_slot(slot_id)
-            _refresh()
+            _confirm_slot_id[0] = slot_id
+            dlg_confirm_slot.open = True
+            page.update()
         return handler
 
     def _toggle_slot(slot_id):
         def handler(e):
             is_checked = e.control.value  # Current UI state
+            if not is_checked:
+                # Verificar se o slot é de um dia anterior
+                slot = db.get_planner_slot_by_id(slot_id)
+                if slot:
+                    slot_date = (
+                        date.fromisoformat(slot["week_start_date"])
+                        + timedelta(days=slot["day_of_week"])
+                    )
+                    if slot_date < today:
+                        # Dia passado → pedir confirmação
+                        _confirm_uncheck_id[0] = slot_id
+                        dlg_confirm_uncheck.open = True
+                        page.update()
+                        return
+            # Fluxo normal (marcar OU desmarcar no mesmo dia/futuro)
             db.update_planner_slot(slot_id, completed=1 if is_checked else 0)
-            
-            # Fetch fresh slot info from DB to be 100% sure
             slot = db.get_planner_slot_by_id(slot_id)
             if not slot:
                 return
-
             if is_checked:
                 from src.utils.xp_system import calculate_xp
                 from src.utils.badges import check_badges
-                from datetime import date, timedelta
                 duration = slot["planned_minutes"]
                 xp = calculate_xp(duration, slot["priority"])
                 slot_date = (
@@ -238,7 +354,6 @@ def planner_page(page: ft.Page) -> ft.Control:
                     notes="Concluído via Planner",
                     session_date=slot_date,
                 )
-                # Mover para o fim do grupo de concluídos
                 completed_count = db.get_completed_count_for_day(
                     slot["day_of_week"], slot["week_start_date"], slot_id
                 )
@@ -253,7 +368,6 @@ def planner_page(page: ft.Page) -> ft.Control:
                 )
                 page.snack_bar.open = True
             else:
-                from datetime import date, timedelta
                 slot_date = (
                     date.fromisoformat(slot["week_start_date"])
                     + timedelta(days=slot["day_of_week"])
@@ -264,19 +378,17 @@ def planner_page(page: ft.Page) -> ft.Control:
                     duration_minutes=duration,
                     session_date=slot_date,
                 )
-                # Mandar para o fim da lista (abaixo dos pendentes)
                 db.update_planner_slot(slot_id, sort_order=9999)
                 if xp_deducted > 0:
                     page.snack_bar = ft.SnackBar(
-                        content=ft.Text(f"Sessão desfeita. {duration}min removidos (-{xp_deducted} XP)", color=Colors.TEXT_PRIMARY),
+                        content=ft.Text(
+                            f"Sessão desfeita. {duration}min removidos (-{xp_deducted} XP)",
+                            color=Colors.TEXT_PRIMARY),
                         bgcolor=Colors.SURFACE_HOVER,
                     )
                     page.snack_bar.open = True
-
-            # Refresh header XP in the main layout
             if page.data and "refresh_header" in page.data:
                 page.data["refresh_header"]()
-
             _refresh()
         return handler
 
